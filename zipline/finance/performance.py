@@ -162,8 +162,16 @@ class PerformanceTracker(object):
         self.total_days = self.sim_params.days_in_period
         self.capital_base = self.sim_params.capital_base
         self.emission_rate = sim_params.emission_rate
+        self.intraday_risk_metrics = \
+            risk.RiskMetricsIterative(self.sim_params)
         self.cumulative_risk_metrics = \
             risk.RiskMetricsIterative(self.sim_params)
+        # TODO: this overrides the logic in the constructor to force
+        # intraday to manage a minutely list of benchmark returns, and
+        # to force cumulative to manage a daily list of benchmark returns.
+        # Would be better to refactor the constructor parameters.
+        self.intraday_risk_metrics.initialize_minute_indices(self.sim_params)
+        self.cumulative_risk_metrics.initialize_daily_indices(self.sim_params)
         self.emission_rate = sim_params.emission_rate
 
         if self.emission_rate == 'daily':
@@ -201,8 +209,31 @@ class PerformanceTracker(object):
             serialize_positions=True
         )
 
+        self.perf_periods = [
+            self.cumulative_performance,
+            self.todays_performance
+        ]
+
+        if self.emission_rate == "minute":
+            self.minute_performance = PerformancePeriod(
+                # initial cash is your capital base.
+                self.capital_base,
+                # the cumulative period will be calculated over the
+                # entire test.
+                self.period_start,
+                self.period_end,
+                # don't save the transactions for the cumulative
+                # period
+                keep_transactions=False,
+                keep_orders=False,
+                # don't serialize positions for cumualtive period
+                serialize_positions=False
+            )
+            self.perf_periods.append(self.minute_performance)
+
         self.saved_dt = self.period_start
         self.returns = []
+        self.daily_bm_returns = []
         # one indexed so that we reach 100%
         self.day_count = 0.0
         self.txn_count = 0
@@ -255,9 +286,11 @@ class PerformanceTracker(object):
             # Naming as intraday to make clear that these results are
             # being updated per minute
             _dict['intraday_risk_metrics'] = \
-                self.cumulative_risk_metrics.to_dict()
+                self.intraday_risk_metrics.to_dict()
             _dict['intraday_perf'] = self.todays_performance.to_dict(
                 self.saved_dt)
+            _dict['cumulative_risk_metrics'] = \
+                self.cumulative_risk_metrics.to_dict()
 
         return _dict
 
@@ -267,26 +300,24 @@ class PerformanceTracker(object):
 
         if event.type == zp.DATASOURCE_TYPE.TRADE:
             #update last sale
-            self.cumulative_performance.update_last_sale(event)
-            self.todays_performance.update_last_sale(event)
+            for perf_period in self.perf_periods:
+                perf_period.update_last_sale(event)
 
         elif event.type == zp.DATASOURCE_TYPE.TRANSACTION:
             # Trade simulation always follows a transaction with the
             # TRADE event that was used to simulate it, so we don't
             # check for end of day rollover messages here.
             self.txn_count += 1
-            self.cumulative_performance.execute_transaction(
-                event
-            )
-            self.todays_performance.execute_transaction(event)
+            for perf_period in self.perf_periods:
+                perf_period.execute_transaction(event)
 
         elif event.type == zp.DATASOURCE_TYPE.DIVIDEND:
-            self.cumulative_performance.add_dividend(event)
-            self.todays_performance.add_dividend(event)
+            for perf_period in self.perf_periods:
+                perf_period.add_dividend(event)
 
         elif event.type == zp.DATASOURCE_TYPE.ORDER:
-            self.cumulative_performance.record_order(event)
-            self.todays_performance.record_order(event)
+            for perf_period in self.perf_periods:
+                perf_period.record_order(event)
 
         elif event.type == zp.DATASOURCE_TYPE.CUSTOM:
             pass
@@ -294,17 +325,64 @@ class PerformanceTracker(object):
             self.all_benchmark_returns[event.dt] = event.returns
 
         #calculate performance as of last trade
-        self.cumulative_performance.calculate_performance()
-        self.todays_performance.calculate_performance()
+        for perf_period in self.perf_periods:
+            perf_period.calculate_performance()
 
     def handle_minute_close(self, dt):
-        #update risk metrics for cumulative performance
-        algorithm_returns = pd.Series({dt: self.todays_performance.returns})
-        benchmark_returns = pd.Series({dt: self.all_benchmark_returns[dt]})
+        todays_date = self.market_close.replace(hour=0, minute=0, second=0,
+                                                microsecond=0)
 
-        self.cumulative_risk_metrics.update(dt,
-                                            algorithm_returns,
-                                            benchmark_returns)
+        minute_returns = self.minute_performance.returns
+        self.minute_performance.rollover()
+        algo_minute_returns = pd.Series({dt: minute_returns})
+        bench_minute_returns = pd.Series({dt: self.all_benchmark_returns[dt]})
+        # the intraday risk is calculated on top of minute performance
+        # returns for the bench and the algo
+        self.intraday_risk_metrics.update(dt,
+                                          algo_minute_returns,
+                                          bench_minute_returns)
+        # the intraday risk metrics compound the minutely returns of the
+        # benchmark.
+        bench_since_open = self.intraday_risk_metrics.benchmark_returns[-1]
+        benchmark_returns = pd.Series({dt: bench_since_open})
+
+        # if we've reached market close, check on dividends
+        if dt == self.market_close:
+            for perf_period in self.perf_periods:
+                perf_period.update_dividends(todays_date)
+
+        algorithm_returns = pd.Series({dt: self.todays_performance.returns})
+
+        self.intraday_risk_metrics.update(dt,
+                                          algorithm_returns,
+                                          benchmark_returns)
+
+        todays_bench_return_obj = zp.DailyReturn(
+            todays_date,
+            bench_since_open
+        )
+
+        todays_return_obj = zp.DailyReturn(
+            todays_date,
+            self.todays_performance.returns
+        )
+
+        # calculate a new cumulative risk metrics object using all the
+        # historical trading days, plus the partial current day.
+        daily_returns = self.returns + [todays_return_obj]
+        daily_bm = self.daily_bm_returns + [todays_bench_return_obj]
+        self.cumulative_risk_metrics = \
+            risk.RiskMetricsBatch(
+                self.sim_params.period_start.replace(hour=0, minute=0),
+                self.sim_params.period_end.replace(hour=0, minute=0),
+                daily_returns,
+                benchmark_returns=daily_bm)
+
+        # if this is the close, save the returns objects for cumulative
+        # risk calculations
+        if dt == self.market_close:
+            self.returns.append(todays_return_obj)
+            self.daily_bm_returns.append(todays_bench_return_obj)
 
     def handle_market_close(self):
         # add the return results from today to the list of DailyReturn objects.

@@ -284,7 +284,7 @@ that date doesn't exceed treasury history range."
 
 
 class RiskMetricsBase(object):
-    def __init__(self, start_date, end_date, returns):
+    def __init__(self, start_date, end_date, returns, benchmark_returns=None):
 
         treasury_curves = trading.environment.treasury_curves
         mask = ((treasury_curves.index >= start_date) &
@@ -297,10 +297,11 @@ class RiskMetricsBase(object):
         self.algorithm_period_returns, self.algorithm_returns = \
             self.calculate_period_returns(returns)
 
-        benchmark_returns = [
-            x for x in trading.environment.benchmark_returns
-            if x.date >= returns[0].date and x.date <= returns[-1].date
-        ]
+        if not benchmark_returns:
+            benchmark_returns = [
+                x for x in trading.environment.benchmark_returns
+                if x.date >= returns[0].date and x.date <= returns[-1].date
+            ]
 
         self.benchmark_period_returns, self.benchmark_returns = \
             self.calculate_period_returns(benchmark_returns)
@@ -315,7 +316,6 @@ class RiskMetricsBase(object):
                 end=end_date
             )
             raise Exception(message)
-
         self.num_trading_days = len(self.benchmark_returns)
         self.benchmark_volatility = self.calculate_volatility(
             self.benchmark_returns)
@@ -540,17 +540,9 @@ class RiskMetricsIterative(RiskMetricsBase):
         self.sim_params = sim_params
 
         if sim_params.emission_rate == 'daily':
-            self.algorithm_returns_cont = pd.Series(index=self.trading_days)
-            self.benchmark_returns_cont = pd.Series(index=self.trading_days)
-
+            self.initialize_daily_indices(sim_params)
         elif sim_params.emission_rate == 'minute':
-
-            self.algorithm_returns_cont = pd.Series(index=pd.date_range(
-                sim_params.first_open, sim_params.last_close,
-                freq="Min"))
-            self.benchmark_returns_cont = pd.Series(index=pd.date_range(
-                sim_params.first_open, sim_params.last_close,
-                freq="Min"))
+            self.initialize_minute_indices(sim_params)
 
         self.algorithm_returns = None
         self.benchmark_returns = None
@@ -576,6 +568,18 @@ class RiskMetricsIterative(RiskMetricsBase):
         self.max_drawdown = 0
         self.current_max = -np.inf
         self.excess_returns = []
+
+    def initialize_minute_indices(self, sim_params):
+        self.algorithm_returns_cont = pd.Series(index=pd.date_range(
+            sim_params.first_open, sim_params.last_close,
+            freq="Min"))
+        self.benchmark_returns_cont = pd.Series(index=pd.date_range(
+            sim_params.first_open, sim_params.last_close,
+            freq="Min"))
+
+    def initialize_daily_indices(self, sim_params):
+        self.algorithm_returns_cont = pd.Series(index=self.trading_days)
+        self.benchmark_returns_cont = pd.Series(index=self.trading_days)
 
     @property
     def last_return_date(self):
