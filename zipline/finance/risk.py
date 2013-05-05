@@ -287,10 +287,15 @@ class RiskMetricsBase(object):
     def __init__(self, start_date, end_date, returns, benchmark_returns=None):
 
         treasury_curves = trading.environment.treasury_curves
-        mask = ((treasury_curves.index >= start_date) &
-                (treasury_curves.index <= end_date))
+        if treasury_curves.index[-1] >= start_date:
+            mask = ((treasury_curves.index >= start_date) &
+                    (treasury_curves.index <= end_date))
 
-        self.treasury_curves = treasury_curves[mask]
+            self.treasury_curves = treasury_curves[mask]
+        else:
+            # our test is beyond the treasury curve history
+            # so we'll use the last available treasury curve
+            self.treasury_curves = treasury_curves[-1:]
 
         self.start_date = start_date
         self.end_date = end_date
